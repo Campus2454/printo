@@ -6,6 +6,7 @@ pass a fake one.
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
@@ -98,6 +99,74 @@ class Job:
         return self.state == JobState.HELD
 
 
+@dataclass(frozen=True)
+class Device:
+    """Something CUPS found that a printer could be added on."""
+
+    uri: str
+    info: str
+    make_model: str
+    device_class: str  # direct, network, serial, file
+
+    @property
+    def label(self) -> str:
+        return self.make_model if self.make_model not in ("", "Unknown") else self.info or self.uri
+
+    @property
+    def scheme(self) -> str:
+        return urlparse(self.uri).scheme
+
+
+@dataclass(frozen=True)
+class Driver:
+    name: str  # ppd name, passed to CUPS
+    make_model: str
+    language: str
+
+
+EVERYWHERE = "everywhere"  # driverless IPP Everywhere
+_DRIVERLESS_SCHEMES = ("ipp", "ipps", "dnssd")
+_PRINTER_NAME = re.compile(r"^[A-Za-z0-9_-]{1,127}$")
+
+
+def suggest_printer_name(text: str) -> str:
+    """Make a valid CUPS queue name out of free text ('HP LaserJet 400')."""
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip()).strip("_")
+    return name[:127] or "printer"
+
+
+def supports_driverless(device_uri: str) -> bool:
+    return urlparse(device_uri).scheme in _DRIVERLESS_SCHEMES
+
+
+def _text(value: Any) -> str:
+    """pycups returns some attributes as a str, others as a list of str."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value) if value is not None else ""
+
+
+def _texts(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)] if value else []
+
+
+_AUTH_WORDS = ("forbidden", "not-authorized", "not-authenticated", "unauthorized")
+_AUTH_CODES = {1282, 1284, 1285, 401, 403}
+
+
+def _friendly(exc: Exception) -> str:
+    text = str(exc)
+    code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else None
+    if code in _AUTH_CODES or any(w in text.lower() for w in _AUTH_WORDS):
+        return (
+            "CUPS says you are not allowed to do this. Add your user to the "
+            "'lpadmin' group (or 'sys'/'wheel' on some distros), then log in again."
+        )
+    return f"CUPS error: {text}"
+
+
 def build_options(
     copies: int = 1,
     sides: str = "one-sided",
@@ -161,6 +230,8 @@ class Backend:
                 raise PrintoError(
                     "python-cups is missing. Install pycups."
                 ) from exc
+            # Never let pycups ask for a password on the terminal: fail fast.
+            cups.setPasswordCB2(lambda *_args: "")
             try:
                 self._conn = cups.Connection()
             except RuntimeError as exc:
@@ -177,7 +248,7 @@ class Backend:
                 raise
             except Exception as exc:  # pycups raises cups.IPPError, RuntimeError
                 self._conn = None  # drop it, try fresh next time
-                raise PrintoError(f"CUPS error: {exc}") from exc
+                raise PrintoError(_friendly(exc)) from exc
 
     # --- printers -------------------------------------------------------
 
@@ -254,3 +325,86 @@ class Backend:
 
     def release(self, job_id: int) -> None:
         self._call("setJobHoldUntil", job_id, "no-hold")
+
+    def job_final_state(self, job_id: int) -> Optional[JobState]:
+        """State of a job that left the queue (done, canceled, failed)."""
+        try:
+            attrs = self._call(
+                "getJobAttributes", job_id, requested_attributes=["job-state"]
+            )
+        except PrintoError:
+            return None
+        state = attrs.get("job-state")
+        return JobState(state) if state is not None else None
+
+    # --- managing printers (needs lpadmin rights) ------------------------
+
+    def devices(self, timeout: int = 10) -> list[Device]:
+        raw = self._call("getDevices", timeout=timeout)
+        out = []
+        for uri, attrs in raw.items():
+            if _text(attrs.get("device-class")) == "file":
+                continue
+            if "://" not in uri:
+                continue  # bare backend names like "socket" or "ipp", not real devices
+            out.append(
+                Device(
+                    uri=uri,
+                    info=_text(attrs.get("device-info", "")),
+                    make_model=_text(attrs.get("device-make-and-model", "")),
+                    device_class=_text(attrs.get("device-class", "")),
+                )
+            )
+        # network printers first, they are what most people want
+        out.sort(key=lambda d: (d.device_class != "network", d.label.lower()))
+        return out
+
+    def drivers(self, query: str, limit: int = 60) -> list[Driver]:
+        """Find drivers (PPDs) whose make/model contains every word of query."""
+        words = query.lower().split()
+        if not words:
+            return []
+        raw = self._call("getPPDs2")
+        out = []
+        for name, attrs in raw.items():
+            model = _text(attrs.get("ppd-make-and-model", ""))
+            low = model.lower()
+            if all(w in low for w in words):
+                langs = _texts(attrs.get("ppd-natural-language")) or ["en"]
+                out.append(Driver(name, model, ",".join(langs)))
+        out.sort(key=lambda d: d.make_model.lower())
+        return out[:limit]
+
+    def add_printer(
+        self,
+        name: str,
+        device_uri: str,
+        driver: str = EVERYWHERE,
+        info: str = "",
+        location: str = "",
+    ) -> None:
+        if not _PRINTER_NAME.match(name):
+            raise PrintoError(
+                "Printer name may only use letters, numbers, - and _ (max 127)."
+            )
+        if not device_uri:
+            raise PrintoError("Choose a device or enter an address first.")
+        self._call(
+            "addPrinter",
+            name,
+            ppdname=driver or EVERYWHERE,
+            device=device_uri,
+            info=info or name,
+            location=location,
+        )
+        self._call("enablePrinter", name)
+        self._call("acceptJobs", name)
+
+    def delete_printer(self, name: str) -> None:
+        self._call("deletePrinter", name)
+
+    def set_default(self, name: str) -> None:
+        self._call("setDefault", name)
+
+    def print_test_page(self, name: str) -> int:
+        return int(self._call("printTestPage", name))

@@ -1,3 +1,13 @@
+printo (0.2.0) unstable; urgency=medium
+
+  * Printers page: add (scan or by address, driverless or pick a driver),
+    remove, set default, print test page.
+  * Presets: save and reuse option sets.
+  * Tray icon (StatusNotifierItem), desktop notifications for finished or
+    failed jobs and stopped printers, --background start option.
+
+ -- Your Name <you@example.com>  Sat, 31 Oct 2026 16:00:00 +0000
+
 printo (0.1.0) unstable; urgency=medium
 
   * Initial release: print files, view queue, cancel/hold/resume jobs.

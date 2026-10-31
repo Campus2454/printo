@@ -1,13 +1,13 @@
 """printo GUI: GTK4 + libadwaita.
 
-Two pages: Print and Queue. All CUPS calls run in a worker thread so the
-window never freezes.
+Three pages: Print, Queue, Printers. All CUPS calls run in worker threads
+so the window never freezes. A tray icon and desktop notifications tell you
+when a job is done or a printer stops.
 """
 
 from __future__ import annotations
 
 import sys
-import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -15,7 +15,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from . import APP_ID, __version__  # noqa: E402
 from .backend import (  # noqa: E402
@@ -25,9 +25,13 @@ from .backend import (  # noqa: E402
     Job,
     JobState,
     Printer,
-    PrintoError,
     build_options,
 )
+from .gui_util import run_async  # noqa: E402
+from .presets import Preset, PresetStore  # noqa: E402
+from .printers_ui import PrintersPage, printer_signature  # noqa: E402
+from .tray import Tray  # noqa: E402
+from .watch import JobWatcher, PrinterWatcher  # noqa: E402
 
 REFRESH_SECONDS = 3
 
@@ -42,30 +46,28 @@ _STATE_TEXT = {
 }
 
 
-def run_async(
-    work: Callable[[], object],
-    done: Callable[[object, Optional[Exception]], None],
-) -> None:
-    """Run work() in a thread, then call done(result, error) on the UI thread."""
-
-    def target() -> None:
-        try:
-            result, error = work(), None
-        except Exception as exc:  # noqa: BLE001 - shown to user
-            result, error = None, exc
-        GLib.idle_add(lambda: done(result, error) or False)
-
-    threading.Thread(target=target, daemon=True).start()
+def _select(row: Adw.ComboRow, keys: list[str], value: str) -> None:
+    """Select the combo entry whose key equals value (if there is one)."""
+    if value in keys:
+        row.set_selected(keys.index(value))
 
 
 class PrintoWindow(Adw.ApplicationWindow):
-    def __init__(self, app: Adw.Application, backend: Backend) -> None:
+    def __init__(self, app: "PrintoApp") -> None:
         super().__init__(application=app, title="printo")
-        self.set_default_size(560, 680)
-        self.backend = backend
+        self.set_default_size(580, 720)
+        self.app = app
+        self.backend = app.backend
+        self.presets = app.presets
         self.files: list[Path] = []
         self.printers: list[Printer] = []
+        self._printer_sig: tuple = ()
         self._queue_rows: list[Gtk.Widget] = []
+        self._preset_list: list[Preset] = []
+        self._loading_presets = False
+        self._polling = False
+        self._cups_down = False
+        self._failed_unseen = False
 
         self.toasts = Adw.ToastOverlay()
         self.stack = Adw.ViewStack()
@@ -75,30 +77,74 @@ class PrintoWindow(Adw.ApplicationWindow):
         self.queue_page = self.stack.add_titled_with_icon(
             self._build_queue_page(), "queue", "Queue", "view-list-symbolic"
         )
-
-        switcher = Adw.ViewSwitcher(
-            stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE
+        self.printers_page = PrintersPage(self.backend, self)
+        self.stack.add_titled_with_icon(
+            self.printers_page, "printers", "Printers", "preferences-system-symbolic"
         )
+
+        switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         header = Adw.HeaderBar(title_widget=switcher)
+        menu = Gio.Menu()
+        menu.append("About printo", "app.about")
+        menu.append("Quit", "app.quit")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
 
         view = Adw.ToolbarView(content=self.stack)
         view.add_top_bar(header)
         self.toasts.set_child(view)
         self.set_content(self.toasts)
 
-        # drag files onto the window
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
         drop.connect("drop", self._on_drop)
         self.add_controller(drop)
 
-        self.refresh_printers()
-        self.refresh_queue()
+        self.connect("close-request", self._on_close)
+        self.connect("notify::is-active", self._on_active_changed)
+
+        self._reload_presets()
+        self.refresh_all()
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+
+    # ------------------------------------------------------------ lifecycle
+
+    def _on_close(self, _w: Gtk.Window) -> bool:
+        if self.app.tray.active:
+            self.set_visible(False)  # keep running in the tray
+            return True
+        return False
+
+    def _on_active_changed(self, *_a: object) -> None:
+        if self.is_active():
+            self._failed_unseen = False
+            self._update_tray()
+
+    def _update_tray(self) -> None:
+        self.app.tray.set_attention(self._failed_unseen or self.app.printwatch.any_stopped)
+
+    def toast(self, text: str) -> None:
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
 
     # ---------------------------------------------------------------- print
 
     def _build_print_page(self) -> Gtk.Widget:
         page = Adw.PreferencesPage()
+
+        # presets
+        group = Adw.PreferencesGroup(title="Preset")
+        self.preset_row = Adw.ComboRow(title="Preset", model=Gtk.StringList.new([]))
+        self.preset_row.connect("notify::selected", self._on_preset_selected)
+        self.preset_delete = Gtk.Button(
+            icon_name="user-trash-symbolic", tooltip_text="Delete this preset",
+            valign=Gtk.Align.CENTER, css_classes=["flat"],
+        )
+        self.preset_delete.connect("clicked", lambda _b: self._delete_preset())
+        self.preset_row.add_suffix(self.preset_delete)
+        group.add(self.preset_row)
+        self.preset_save = Adw.EntryRow(title="Save these settings as a preset…")
+        self.preset_save.set_show_apply_button(True)
+        self.preset_save.connect("apply", self._on_save_preset)
+        group.add(self.preset_save)
+        page.add(group)
 
         # file
         group = Adw.PreferencesGroup(title="File")
@@ -113,8 +159,7 @@ class PrintoWindow(Adw.ApplicationWindow):
 
         # printer
         group = Adw.PreferencesGroup(title="Printer")
-        self.printer_row = Adw.ComboRow(title="Printer")
-        self.printer_row.set_model(Gtk.StringList.new([]))
+        self.printer_row = Adw.ComboRow(title="Printer", model=Gtk.StringList.new([]))
         self.printer_status = Gtk.Label(css_classes=["dim-label"])
         group.add(self.printer_row)
         group.add(self.printer_status)
@@ -151,7 +196,6 @@ class PrintoWindow(Adw.ApplicationWindow):
         group.add(self.pages_row)
         page.add(group)
 
-        # print button
         group = Adw.PreferencesGroup()
         self.print_btn = Gtk.Button(
             label="Print", css_classes=["suggested-action", "pill"],
@@ -162,22 +206,93 @@ class PrintoWindow(Adw.ApplicationWindow):
         page.add(group)
         return page
 
+    # presets -------------------------------------------------------------
+
+    def _reload_presets(self, select: str = "") -> None:
+        self._loading_presets = True
+        self._preset_list = self.presets.all()
+        self.preset_row.set_model(Gtk.StringList.new([p.name for p in self._preset_list]))
+        names = [p.name for p in self._preset_list]
+        self.preset_row.set_selected(names.index(select) if select in names else 0)
+        self._loading_presets = False
+        self._update_preset_delete()
+
+    def _current_preset(self) -> Optional[Preset]:
+        i = self.preset_row.get_selected()
+        return self._preset_list[i] if 0 <= i < len(self._preset_list) else None
+
+    def _update_preset_delete(self) -> None:
+        p = self._current_preset()
+        self.preset_delete.set_sensitive(bool(p) and not self.presets.is_builtin(p.name))
+
+    def _on_preset_selected(self, *_a: object) -> None:
+        self._update_preset_delete()
+        if self._loading_presets:
+            return
+        p = self._current_preset()
+        if p is None:
+            return
+        self.copies_row.set_value(p.copies)
+        _select(self.sides_row, self._side_keys, p.sides)
+        _select(self.paper_row, self._paper_keys, p.paper)
+        _select(self.orient_row, self._orient_keys, p.orientation)
+        if p.printer:
+            _select(self.printer_row, [pr.name for pr in self.printers], p.printer)
+
+    def _on_save_preset(self, row: Adw.EntryRow) -> None:
+        name = row.get_text().strip()
+        if not name:
+            return
+        printer = self._selected_printer()
+        try:
+            self.presets.save(
+                Preset(
+                    name=name,
+                    copies=int(self.copies_row.get_value()),
+                    sides=self._side_keys[self.sides_row.get_selected()],
+                    paper=self._paper_keys[self.paper_row.get_selected()],
+                    orientation=self._orient_keys[self.orient_row.get_selected()],
+                    printer=printer.name if printer else "",
+                )
+            )
+        except (ValueError, OSError) as exc:
+            self.toast(str(exc))
+            return
+        row.set_text("")
+        self._reload_presets(select=name)
+        self.toast(f"Saved preset '{name}'")
+
+    def _delete_preset(self) -> None:
+        p = self._current_preset()
+        if p is None:
+            return
+        try:
+            self.presets.delete(p.name)
+        except (ValueError, OSError) as exc:
+            self.toast(str(exc))
+            return
+        self._reload_presets()
+        self.toast(f"Deleted preset '{p.name}'")
+
+    # files ---------------------------------------------------------------
+
     def _set_files(self, files: list[Path]) -> None:
         self.files = files
         if not files:
             self.file_row.set_title("No file chosen")
             self.file_row.set_subtitle("Drop files here, or choose")
         elif len(files) == 1:
-            self.file_row.set_title(files[0].name)
-            self.file_row.set_subtitle(str(files[0].parent))
+            self.file_row.set_title(GLib.markup_escape_text(files[0].name))
+            self.file_row.set_subtitle(GLib.markup_escape_text(str(files[0].parent)))
         else:
             self.file_row.set_title(f"{len(files)} files")
-            self.file_row.set_subtitle(", ".join(f.name for f in files[:3]))
+            self.file_row.set_subtitle(
+                GLib.markup_escape_text(", ".join(f.name for f in files[:3]))
+            )
         self._update_print_btn()
 
     def _update_print_btn(self) -> None:
-        ok = bool(self.files) and bool(self.printers)
-        self.print_btn.set_sensitive(ok)
+        self.print_btn.set_sensitive(bool(self.files) and bool(self.printers))
 
     def _on_choose(self, _btn: Gtk.Button) -> None:
         dialog = Gtk.FileDialog(title="Choose files to print")
@@ -203,6 +318,8 @@ class PrintoWindow(Adw.ApplicationWindow):
     def open_files(self, paths: list[Path]) -> None:
         self._set_files(paths)
         self.stack.set_visible_child_name("print")
+
+    # printing ------------------------------------------------------------
 
     def _selected_printer(self) -> Optional[Printer]:
         i = self.printer_row.get_selected()
@@ -241,7 +358,7 @@ class PrintoWindow(Adw.ApplicationWindow):
         def work() -> list[int]:
             return [self.backend.print_file(printer.name, f, opts) for f in files]
 
-        def done(result: object, error: Optional[Exception]) -> None:
+        def done(_result: object, error: Optional[Exception]) -> None:
             self._update_print_btn()
             if error:
                 self.toast(str(error))
@@ -249,7 +366,7 @@ class PrintoWindow(Adw.ApplicationWindow):
             n = len(files)
             self.toast(f"Sent {n} file{'s' if n != 1 else ''} to {printer.label}")
             self._set_files([])
-            self.refresh_queue()
+            self.refresh_all()
             self.stack.set_visible_child_name("queue")
 
         run_async(work, done)
@@ -274,33 +391,58 @@ class PrintoWindow(Adw.ApplicationWindow):
         return self.queue_stack
 
     def _tick(self) -> bool:
-        self.refresh_queue()
-        return True  # keep timer
+        self.refresh_all(quiet=True)
+        return True  # keep the timer
 
-    def refresh_printers(self) -> None:
+    def refresh_all(self, quiet: bool = False) -> None:
+        """Poll CUPS once: printers + jobs + what changed since last time."""
+        if self._polling:
+            return
+        self._polling = True
+
+        def work() -> tuple:
+            printers = self.backend.printers()
+            jobs = self.backend.jobs()
+            events = self.app.jobwatch.update(jobs, self.backend.job_final_state)
+            stopped = self.app.printwatch.update(printers)
+            return printers, jobs, events, stopped
+
         def done(result: object, error: Optional[Exception]) -> None:
+            self._polling = False
             if error:
-                self.toast(str(error))
+                if not self._cups_down:  # say it once, not every 3 seconds
+                    self.toast(str(error))
+                self._cups_down = True
+                self.queue_empty.set_title("Cannot reach CUPS")
+                self.queue_empty.set_description(str(error))
+                self.queue_stack.set_visible_child_name("empty")
                 return
-            self.printers = result  # type: ignore[assignment]
-            self.printer_row.set_model(
-                Gtk.StringList.new([p.label for p in self.printers])
-            )
-            self.printer_row.set_selected(0)
-            self._on_printer_changed()
-            self._update_print_btn()
-            if not self.printers:
-                self.toast("No printers found. Add one in CUPS first.")
+            if self._cups_down:
+                self._cups_down = False
+                self.queue_empty.set_title("Nothing in the queue")
+                self.queue_empty.set_description("Print jobs show up here.")
+            printers, jobs, events, stopped = result  # type: ignore[misc]
+            self._apply_printers(printers)
+            self._show_jobs(jobs)
+            self._notify(events, stopped)
 
-        run_async(self.backend.printers, done)
+        run_async(work, done)
 
-    def refresh_queue(self) -> None:
-        def done(result: object, error: Optional[Exception]) -> None:
-            if error:
-                return  # quiet on poll; print page already showed errors
-            self._show_jobs(result)  # type: ignore[arg-type]
-
-        run_async(self.backend.jobs, done)
+    def _apply_printers(self, printers: list[Printer]) -> None:
+        sig = printer_signature(printers)
+        if sig == self._printer_sig:
+            return
+        self._printer_sig = sig
+        keep = self._selected_printer()
+        self.printers = printers
+        self.printer_row.set_model(Gtk.StringList.new([p.label for p in printers]))
+        names = [p.name for p in printers]
+        self.printer_row.set_selected(
+            names.index(keep.name) if keep and keep.name in names else 0
+        )
+        self._on_printer_changed()
+        self._update_print_btn()
+        self.printers_page.set_printers(printers)
 
     def _show_jobs(self, jobs: list[Job]) -> None:
         for row in self._queue_rows:
@@ -323,6 +465,17 @@ class PrintoWindow(Adw.ApplicationWindow):
         self.queue_stack.set_visible_child_name("list" if jobs else "empty")
         self.queue_page.set_badge_number(len(jobs))
 
+    def _notify(self, events: list, stopped: list[Printer]) -> None:
+        for ev in events:
+            if ev.kind == "done":
+                self.app.notify(f"job-{ev.job.id}", f"Printed: {ev.job.title}", f"on {ev.job.printer}")
+            else:
+                self._failed_unseen = not self.is_active()
+                self.app.notify(f"job-{ev.job.id}", f"Print failed: {ev.job.title}", f"on {ev.job.printer}")
+        for p in stopped:
+            self.app.notify(f"printer-{p.name}", f"Printer stopped: {p.label}", p.state_message or "Check the printer")
+        self._update_tray()
+
     def _job_button(self, icon: str, tip: str, fn: Callable[[int], None], job_id: int) -> Gtk.Button:
         btn = Gtk.Button(
             icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER,
@@ -335,7 +488,7 @@ class PrintoWindow(Adw.ApplicationWindow):
         def done(_r: object, error: Optional[Exception]) -> None:
             if error:
                 self.toast(str(error))
-            self.refresh_queue()
+            self.refresh_all()
 
         run_async(lambda: fn(job_id), done)
 
@@ -348,27 +501,72 @@ class PrintoWindow(Adw.ApplicationWindow):
     def _release(self, job_id: int) -> None:
         self._job_action(self.backend.release, job_id)
 
-    # ---------------------------------------------------------------- misc
-
-    def toast(self, text: str) -> None:
-        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
-
 
 class PrintoApp(Adw.Application):
     def __init__(self) -> None:
         super().__init__(
             application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN
         )
+        self.add_main_option(
+            "background", ord("b"), GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
+            "Start hidden in the tray", None,
+        )
         self.backend = Backend()
+        self.presets = PresetStore()
+        self.jobwatch = JobWatcher()
+        self.printwatch = PrinterWatcher()
+        self.tray = Tray(self.show_window)
         self.win: Optional[PrintoWindow] = None
+        self.background = False
+        self.connect("handle-local-options", self._on_local_options)
+
+    def _on_local_options(self, _app: Gio.Application, options: GLib.VariantDict) -> int:
+        self.background = options.contains("background")
+        return -1  # carry on and start normally
+
+    def do_startup(self) -> None:
+        Adw.Application.do_startup(self)
+        for name, fn in (("quit", self._quit), ("about", self._about), ("show", lambda *_a: self.show_window())):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", fn)
+            self.add_action(action)
+        self.set_accels_for_action("app.quit", ["<Primary>q"])
+        if self.tray.start():
+            self.hold()  # stay alive with the window hidden
+
+    def _quit(self, *_a: object) -> None:
+        self.tray.stop()
+        self.quit()
+
+    def _about(self, *_a: object) -> None:
+        Adw.AboutWindow(
+            transient_for=self.win, application_name="printo",
+            application_icon=APP_ID, version=__version__,
+            developer_name="Campus2454", license_type=Gtk.License.MIT_X11,
+            website="https://github.com/Campus2454/printo",
+            comments="A small, fast GUI for CUPS",
+        ).present()
 
     def _window(self) -> PrintoWindow:
         if self.win is None:
-            self.win = PrintoWindow(self, self.backend)
+            self.win = PrintoWindow(self)
         return self.win
 
-    def do_activate(self) -> None:
+    def show_window(self) -> None:
         self._window().present()
+
+    def notify(self, notif_id: str, title: str, body: str) -> None:
+        n = Gio.Notification.new(title)
+        n.set_body(body)
+        n.set_default_action("app.show")
+        self.send_notification(notif_id, n)
+
+    def do_activate(self) -> None:
+        win = self._window()
+        if self.background and self.tray.active:
+            self.background = False  # only the first start is silent
+            return
+        win.present()
 
     def do_open(self, files: list[Gio.File], _n: int, _hint: str) -> None:
         win = self._window()

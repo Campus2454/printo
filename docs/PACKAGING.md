@@ -4,8 +4,8 @@ Before any package: make a **release tag** on GitHub. Packages download the
 source tarball of the tag.
 
 ```bash
-git tag -a v0.1.0 -m "printo 0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "printo 0.2.0"
+git push origin v0.2.0
 ```
 
 Version lives in three places; keep them equal when you bump:
@@ -18,7 +18,7 @@ entry at the top of `debian/changelog`).
 sudo apt install debhelper dh-python pybuild-plugin-pyproject \
                  python3-setuptools python3-wheel python3-all fakeroot
 dpkg-buildpackage -us -uc -b
-sudo apt install ../printo_0.1.0_all.deb
+sudo apt install ../printo_0.2.0_all.deb
 ```
 
 Edit the maintainer name/email in `debian/control` and `debian/changelog`
@@ -48,7 +48,7 @@ cp ../printo/packaging/arch/PKGBUILD .
 updpkgsums
 makepkg --printsrcinfo > .SRCINFO
 git add PKGBUILD .SRCINFO
-git commit -m "printo 0.1.0"
+git commit -m "printo 0.2.0"
 git push
 ```
 
