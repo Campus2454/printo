@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.venv/
+
+# packaging output
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.tar.*
+/packaging/arch/*.pkg.tar.*
+debian/.debhelper/
+debian/printo/
+debian/*.substvars
+debian/*.log
+debian/debhelper-build-stamp
+debian/files
+*.deb
+*.buildinfo
+*.changes
+.pybuild/

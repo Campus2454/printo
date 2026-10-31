@@ -1,0 +1,28 @@
+Source: printo
+Section: utils
+Priority: optional
+Maintainer: Your Name <you@example.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               pybuild-plugin-pyproject,
+               python3-all,
+               python3-setuptools,
+               python3-wheel
+Standards-Version: 4.6.2
+Homepage: https://github.com/Campus2454/printo
+Rules-Requires-Root: no
+
+Package: printo
+Architecture: all
+Depends: ${python3:Depends},
+         ${misc:Depends},
+         python3-gi,
+         python3-cups,
+         gir1.2-gtk-4.0,
+         gir1.2-adw-1,
+         cups-client
+Description: small, fast GTK4 GUI for CUPS
+ printo prints files and manages the print queue without the clutter of
+ the stock CUPS tools: drop a file, pick a printer, press Print.
+ .
+ Pause, resume and cancel jobs from the queue page.

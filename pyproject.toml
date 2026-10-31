@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printo"
+version = "0.1.0"
+description = "A small, fast GUI for CUPS"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+# PyGObject and pycups come from the distro (python-gobject, python-pycups),
+# not pip: they need system GTK/CUPS libraries. So no dependencies listed.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Campus2454/printo"
+
+[project.gui-scripts]
+printo = "printo.app:main"
+
+[tool.setuptools]
+packages = ["printo"]

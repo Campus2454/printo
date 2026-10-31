@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=printo
+GenericName=Print
+Comment=Print files and manage the print queue
+Comment[th]=พิมพ์ไฟล์และจัดการคิวงานพิมพ์
+Exec=printo %F
+Icon=io.github.campus2454.printo
+Terminal=false
+Categories=Office;Printing;GTK;
+Keywords=print;printer;cups;queue;พิมพ์;
+MimeType=application/pdf;text/plain;image/png;image/jpeg;image/svg+xml;application/postscript;
+StartupNotify=true

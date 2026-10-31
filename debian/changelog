@@ -1,0 +1,5 @@
+printo (0.1.0) unstable; urgency=medium
+
+  * Initial release: print files, view queue, cancel/hold/resume jobs.
+
+ -- Your Name <you@example.com>  Sat, 31 Oct 2026 12:00:00 +0000
