@@ -20,3 +20,4 @@ debian/files
 *.buildinfo
 *.changes
 .pybuild/
+debian/*.debhelper
