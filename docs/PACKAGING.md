@@ -26,7 +26,8 @@ first.
 
 ## Arch / Manjaro / EndeavourOS (pacman)
 
-Test locally:
+Test locally (`updpkgsums` edits your working copy only; do not commit its result,
+the AUR copy is where the real checksum lives):
 
 ```bash
 cd packaging/arch

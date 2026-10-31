@@ -9,8 +9,10 @@ license=('MIT')
 depends=('python' 'python-gobject' 'python-pycups' 'gtk4' 'libadwaita' 'cups')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Fill in with:  updpkgsums   (from pacman-contrib)
-sha256sums=('63e469dd616de5d5208fc295029a48f1ccd6216140e368b5519051cd9bdfaf56')
+# Keep SKIP in this repo copy. A tag's tarball contains this very file, so a
+# checksum written here would change the tarball and never match.
+# The real checksum goes in the PKGBUILD of the AUR repo: run `updpkgsums` there.
+sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
