@@ -10,7 +10,7 @@ depends=('python' 'python-gobject' 'python-pycups' 'gtk4' 'libadwaita' 'cups')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Fill in with:  updpkgsums   (from pacman-contrib)
-sha256sums=('SKIP')
+sha256sums=('63e469dd616de5d5208fc295029a48f1ccd6216140e368b5519051cd9bdfaf56')
 
 build() {
   cd "$pkgname-$pkgver"
